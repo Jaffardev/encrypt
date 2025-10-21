@@ -1,0 +1,323 @@
+Perfect 👍 — you want a ready-made Blazor component that demonstrates:
+✅ Generating the RSA key pair in the browser
+✅ Sending the public key to the API
+✅ Receiving the encrypted card number JSON
+✅ Decrypting it on the client
+✅ Displaying the full card number securely
+
+Let’s build it cleanly.
+
+
+---
+
+🧱 Project structure (Blazor Hosted model)
+
+CreditCardApp/
+ ├── Client/
+ │   ├── Pages/
+ │   │   └── CreditCardViewer.razor
+ │   ├── wwwroot/
+ │   │   └── crypto-client.js
+ ├── Server/
+ │   ├── Controllers/
+ │   │   └── SecureController.cs
+ │   └── Models/
+ │       ├── EncryptRequest.cs
+ │       └── EncryptedResponse.cs
+ ├── Shared/
+ │   └── (optional shared DTOs)
+
+
+---
+
+🔹 Step 1: wwwroot/crypto-client.js
+
+Add this JS file to your Blazor WebAssembly client:
+
+// wwwroot/crypto-client.js
+
+async function generateClientKeyPair() {
+  const keys = await window.crypto.subtle.generateKey(
+    {
+      name: "RSA-OAEP",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256"
+    },
+    true,
+    ["encrypt", "decrypt"]
+  );
+  window.__clientRSA = keys;
+  return true;
+}
+
+async function exportPublicKeyBase64() {
+  if (!window.__clientRSA) throw "Key pair not generated";
+  const spki = await window.crypto.subtle.exportKey("spki", window.__clientRSA.publicKey);
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(spki)));
+  return b64;
+}
+
+async function decryptPayload(payload) {
+  if (!window.__clientRSA) throw "Key pair not found";
+
+  const encKeyBytes = Uint8Array.from(atob(payload.encryptedKeyB64), c => c.charCodeAt(0)).buffer;
+  const aesKeyRaw = await window.crypto.subtle.decrypt(
+    { name: "RSA-OAEP" },
+    window.__clientRSA.privateKey,
+    encKeyBytes
+  );
+
+  const aesKey = await window.crypto.subtle.importKey(
+    "raw",
+    aesKeyRaw,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"]
+  );
+
+  const iv = Uint8Array.from(atob(payload.ivB64), c => c.charCodeAt(0));
+  const ciphertext = Uint8Array.from(atob(payload.ciphertextB64), c => c.charCodeAt(0));
+
+  const plainBuffer = await window.crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: iv
+    },
+    aesKey,
+    ciphertext
+  );
+
+  const decoder = new TextDecoder();
+  return decoder.decode(plainBuffer);
+}
+
+function clearClientKeys() {
+  window.__clientRSA = null;
+  return true;
+}
+
+window.cryptoClient = {
+  generateClientKeyPair,
+  exportPublicKeyBase64,
+  decryptPayload,
+  clearClientKeys
+};
+
+Include this in your index.html:
+
+<script src="crypto-client.js"></script>
+
+
+---
+
+🔹 Step 2: Server/Models/EncryptRequest.cs
+
+public class EncryptRequest
+{
+    public string PublicKeyBase64 { get; set; } = default!;
+}
+
+
+---
+
+🔹 Step 3: Server/Models/EncryptedResponse.cs
+
+public class EncryptedResponse
+{
+    public string EncryptedKeyB64 { get; set; } = default!;
+    public string IvB64 { get; set; } = default!;
+    public string CiphertextB64 { get; set; } = default!;
+}
+
+
+---
+
+🔹 Step 4: Server/Controllers/SecureController.cs
+
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace CreditCardApp.Server.Controllers
+{
+    [ApiController]
+    [Route("api/secure")]
+    public class SecureController : ControllerBase
+    {
+        [HttpPost("encrypt-card")]
+        public IActionResult EncryptCard([FromBody] EncryptRequest req)
+        {
+            // Simulate credit card number from database
+            string creditCardNumber = "4111111111111111";
+
+            // 1) Import client public key
+            var publicKeyBytes = Convert.FromBase64String(req.PublicKeyBase64);
+            using var rsa = RSA.Create();
+            rsa.ImportSubjectPublicKeyInfo(publicKeyBytes, out _);
+
+            // 2) Generate AES key + IV
+            var aesKey = new byte[32];
+            var iv = new byte[12];
+            RandomNumberGenerator.Fill(aesKey);
+            RandomNumberGenerator.Fill(iv);
+
+            // 3) Encrypt credit card with AES-GCM
+            var plainBytes = Encoding.UTF8.GetBytes(creditCardNumber);
+            byte[] ciphertext = new byte[plainBytes.Length];
+            byte[] tag = new byte[16];
+
+            using (var aesGcm = new AesGcm(aesKey))
+            {
+                aesGcm.Encrypt(iv, plainBytes, ciphertext, tag);
+            }
+
+            var ciphertextWithTag = new byte[ciphertext.Length + tag.Length];
+            Buffer.BlockCopy(ciphertext, 0, ciphertextWithTag, 0, ciphertext.Length);
+            Buffer.BlockCopy(tag, 0, ciphertextWithTag, ciphertext.Length, tag.Length);
+
+            // 4) Encrypt AES key using RSA public key
+            var encryptedAesKey = rsa.Encrypt(aesKey, RSAEncryptionPadding.OaepSHA256);
+
+            // 5) Build response
+            var response = new EncryptedResponse
+            {
+                EncryptedKeyB64 = Convert.ToBase64String(encryptedAesKey),
+                IvB64 = Convert.ToBase64String(iv),
+                CiphertextB64 = Convert.ToBase64String(ciphertextWithTag)
+            };
+
+            // Clear sensitive data
+            Array.Clear(aesKey);
+            Array.Clear(plainBytes);
+
+            return Ok(response);
+        }
+    }
+}
+
+
+---
+
+🔹 Step 5: Client/Pages/CreditCardViewer.razor
+
+@page "/card"
+@inject IJSRuntime JS
+@inject HttpClient Http
+
+<h3>Credit Card Viewer</h3>
+
+@if (isLoading)
+{
+    <p><em>Loading and decrypting card number...</em></p>
+}
+else if (!string.IsNullOrEmpty(fullCardNumber))
+{
+    <p><strong>Decrypted Card Number:</strong> @fullCardNumber</p>
+}
+else if (!string.IsNullOrEmpty(error))
+{
+    <p style="color:red">@error</p>
+}
+else
+{
+    <button class="btn btn-primary" @onclick="ViewCardAsync">View Credit Card</button>
+}
+
+@code {
+    private bool isLoading;
+    private string? fullCardNumber;
+    private string? error;
+
+    private async Task ViewCardAsync()
+    {
+        try
+        {
+            isLoading = true;
+            error = null;
+            fullCardNumber = null;
+            StateHasChanged();
+
+            // Generate keypair
+            await JS.InvokeVoidAsync("cryptoClient.generateClientKeyPair");
+
+            // Export public key
+            var pubKeyB64 = await JS.InvokeAsync<string>("cryptoClient.exportPublicKeyBase64");
+
+            // Send public key to API
+            var req = new { PublicKeyBase64 = pubKeyB64 };
+            var response = await Http.PostAsJsonAsync("api/secure/encrypt-card", req);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                error = $"API error: {response.StatusCode}";
+                return;
+            }
+
+            var encrypted = await response.Content.ReadFromJsonAsync<EncryptedResponse>();
+
+            if (encrypted == null)
+            {
+                error = "Invalid API response.";
+                return;
+            }
+
+            // Decrypt on client side
+            fullCardNumber = await JS.InvokeAsync<string>("cryptoClient.decryptPayload", encrypted);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            isLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    public class EncryptedResponse
+    {
+        public string EncryptedKeyB64 { get; set; } = default!;
+        public string IvB64 { get; set; } = default!;
+        public string CiphertextB64 { get; set; } = default!;
+    }
+}
+
+
+---
+
+🔹 Step 6: Try it
+
+1. Run your Blazor WebAssembly hosted app.
+
+
+2. Navigate to /card.
+
+
+3. Click “View Credit Card”.
+→ The client will generate keys.
+→ The API encrypts the card number and sends it back.
+→ The client decrypts and displays the full card number.
+
+
+
+
+---
+
+✅ Security Recap
+
+Step	Security layer
+
+HTTPS	Transport-level encryption
+RSA-OAEP	Encrypts AES key securely
+AES-GCM	Encrypts credit card number with integrity
+Key lifetime	Per-session (not persisted)
+Client-side private key	Never sent to server
+
+
+
+---
+
+Would you like me to add a masked display toggle (e.g., click “Show/Hide full number”) so you can use the same component in production more safely?
+
